@@ -2,7 +2,12 @@ import { MockProvider } from "ethereum-waffle";
 import { Wallet } from "ethers";
 import { expect } from "chai";
 import { ethers, waffle, artifacts } from "hardhat";
-import { MetaSoccerStaking, TestERC721, TestToken } from "../typechain";
+import {
+  MetaSoccerStaking,
+  TestERC721,
+  TestToken,
+  EntropyReader,
+} from "../typechain";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
 
 describe("ScoutInitialStaking", function () {
@@ -10,6 +15,7 @@ describe("ScoutInitialStaking", function () {
     const [deployer, nonDeployer, nonDeployer2] = await ethers.getSigners();
     const testERC721 = artifacts.readArtifactSync("TestERC721");
     const testToken = artifacts.readArtifactSync("TestToken");
+    const entropyReaderContract = artifacts.readArtifactSync("EntropyReader");
 
     const nftToStake = (await waffle.deployContract(deployer, testERC721, [
       "NFT To stake",
@@ -39,8 +45,14 @@ describe("ScoutInitialStaking", function () {
       [nftToStake.address, rewardsPeriod, "scoutStaking", "STK"]
     )) as MetaSoccerStaking;
 
+    const entropyReader = (await waffle.deployContract(
+      deployer,
+      entropyReaderContract
+    )) as EntropyReader;
+
     return {
       nftToStake,
+      entropyReader,
       anotherNft,
       token1,
       token2,
@@ -67,14 +79,29 @@ describe("ScoutInitialStaking", function () {
     owner: SignerWithAddress,
     tokenId: number,
     tokenAttribute: string = "",
-    tokenValue: string = ""
+    tokenValue: string = "",
+    entropyReader?: EntropyReader
   ) {
     await nftToStake.mint(owner.address, tokenId);
     if (tokenAttribute !== "" && tokenValue !== "") {
-      await nftToStake.setTokenAttribute(tokenId, tokenAttribute, tokenValue);
-      expect(
-        await nftToStake.tokenAttributes(tokenId, tokenAttribute)
-      ).to.equal(tokenValue);
+      if (entropyReader !== undefined) {
+        // 90% chance of level 3, 10% chance of level 4, using modulo 10
+        const seeds = [
+          "20037959305907081881787792045789224328451420942780897008884961732541851472", // Returns a module of 3 => level 3
+          "20037959305907081882362477873613932650335801077962262952741988903360702288", // Returns a module of 9 => level 4
+        ];
+        let seed = seeds[0];
+        if (tokenValue === "4") {
+          seed = seeds[1];
+        }
+        await entropyReader.setEntropy(tokenId, seed);
+        expect(await entropyReader.entropyStorage(tokenId)).to.equal(seed);
+      } else {
+        await nftToStake.setTokenAttribute(tokenId, tokenAttribute, tokenValue);
+        expect(
+          await nftToStake.tokenAttributes(tokenId, tokenAttribute)
+        ).to.equal(tokenValue);
+      }
     }
     const r = nftToStake
       .connect(owner)
@@ -215,6 +242,7 @@ describe("ScoutInitialStaking", function () {
 
   describe("Staking and withdrawWithRewards", () => {
     let nftToStake: TestERC721;
+    let entropyReader: EntropyReader;
     let token1: TestToken;
     let token2: TestToken;
     let scoutStaking: MetaSoccerStaking;
@@ -225,12 +253,12 @@ describe("ScoutInitialStaking", function () {
     const rewardAttribute = "Level";
     const rewards = {
       token1: {
-        "1": 100000,
-        "2": 1000000,
+        "3": 100000,
+        "4": 1000000,
       },
       token2: {
-        "1": 100000,
-        "2": 1000000,
+        "3": 100000,
+        "4": 1000000,
       },
     };
 
@@ -245,6 +273,7 @@ describe("ScoutInitialStaking", function () {
       nonDeployer = loadedFixtures.nonDeployer;
       nonDeployer2 = loadedFixtures.nonDeployer2;
       rewardsPeriod = loadedFixtures.rewardsPeriod;
+      entropyReader = loadedFixtures.entropyReader;
     });
 
     it("Should allow admin to add token rewards from his wallet", async function () {
@@ -266,9 +295,13 @@ describe("ScoutInitialStaking", function () {
       await scoutStaking.setRewardTokens([token1.address, token2.address]);
       await scoutStaking.setRewardsPool(deployer.address);
       await scoutStaking.setRewardsAttribute(rewardAttribute);
+      await scoutStaking.setEntropyReader(entropyReader.address);
       expect(await scoutStaking.rewardsTokens(0)).to.equal(token1.address);
       expect(await scoutStaking.rewardsTokens(1)).to.equal(token2.address);
       expect(await scoutStaking.rewardsPool()).to.equal(deployer.address);
+      expect(await scoutStaking.entropyReader()).to.equal(
+        entropyReader.address
+      );
       expect(await scoutStaking.rewardsAttribute()).to.equal(rewardAttribute);
       // Set Token1 rewards
       for (const [rewardValue, rewardAmount] of Object.entries(
@@ -296,7 +329,8 @@ describe("ScoutInitialStaking", function () {
         nonDeployer,
         1,
         rewardAttribute,
-        "1"
+        "3",
+        entropyReader
       );
 
       const owner = await nftToStake.ownerOf(1);
@@ -310,7 +344,8 @@ describe("ScoutInitialStaking", function () {
         nonDeployer2,
         2,
         rewardAttribute,
-        "2"
+        "4",
+        entropyReader
       );
 
       const owner = await nftToStake.ownerOf(2);
@@ -322,30 +357,35 @@ describe("ScoutInitialStaking", function () {
       expect(stakedOwner).to.be.equal(nonDeployer.address);
       const stakedOwner2 = await scoutStaking.ownerOf(2);
       expect(stakedOwner2).to.be.equal(nonDeployer2.address);
+      expect(
+        await scoutStaking.getOwnedTokenIds(nonDeployer.address)
+      ).to.deep.equal([ethers.BigNumber.from(1)]);
+      expect(
+        await scoutStaking.getOwnedTokenIds(nonDeployer2.address)
+      ).to.deep.equal([ethers.BigNumber.from(2)]);
     });
 
     it("Should unstake with rewards to the original owner", async function () {
       // Wait for rewards Period;
       await advanceToRewardTime(Date.now() / 1000, rewardsPeriod);
-      const tx1 = scoutStaking.connect(nonDeployer).withdrawWithRewards(1);
-      await expect(tx1).to.not.be.reverted;
+      await scoutStaking.connect(nonDeployer).withdrawWithRewards(1);
       const tx2 = scoutStaking.connect(nonDeployer2).withdrawWithRewards(2);
       await expect(tx2).to.not.be.reverted;
 
       expect(await nftToStake.ownerOf(1)).to.be.equal(nonDeployer.address);
       expect(await token1.balanceOf(nonDeployer.address)).to.equal(
-        rewards.token1["1"]
+        rewards.token1["3"]
       );
       expect(await token2.balanceOf(nonDeployer.address)).to.equal(
-        rewards.token2["1"]
+        rewards.token2["3"]
       );
 
       expect(await nftToStake.ownerOf(2)).to.be.equal(nonDeployer2.address);
       expect(await token1.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token1["2"]
+        rewards.token1["4"]
       );
       expect(await token2.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token2["2"]
+        rewards.token2["4"]
       );
     });
 
@@ -382,6 +422,7 @@ describe("ScoutInitialStaking", function () {
 
   describe("Staking with recurrent rewards", () => {
     let nftToStake: TestERC721;
+    let entropyReader: EntropyReader;
     let token1: TestToken;
     let token2: TestToken;
     let scoutStaking: MetaSoccerStaking;
@@ -394,12 +435,12 @@ describe("ScoutInitialStaking", function () {
     const rewardAttribute = "Level";
     const rewards = {
       token1: {
-        "1": 100000,
-        "2": 1000000,
+        "3": 100000,
+        "4": 1000000,
       },
       token2: {
-        "1": 100000,
-        "2": 1000000,
+        "3": 100000,
+        "4": 1000000,
       },
     };
 
@@ -413,6 +454,7 @@ describe("ScoutInitialStaking", function () {
       deployer = loadedFixtures.deployer;
       nonDeployer = loadedFixtures.nonDeployer;
       nonDeployer2 = loadedFixtures.nonDeployer2;
+      entropyReader = loadedFixtures.entropyReader;
     });
 
     it("Should allow deployer to set recurrent rewards from his wallet", async function () {
@@ -436,11 +478,13 @@ describe("ScoutInitialStaking", function () {
       await scoutStaking.setRewardsAttribute(rewardAttribute);
       await scoutStaking.setRecurrentRewards(true);
       await scoutStaking.setRewardsPeriod(recurrentRewardPeriod);
+      await scoutStaking.setEntropyReader(entropyReader.address);
       expect(await scoutStaking.rewardsTokens(0)).to.equal(token1.address);
       expect(await scoutStaking.rewardsTokens(1)).to.equal(token2.address);
       expect(await scoutStaking.rewardsPool()).to.equal(deployer.address);
       expect(await scoutStaking.rewardsAttribute()).to.equal(rewardAttribute);
       expect(await scoutStaking.recurrentRewards()).to.equal(true);
+      expect(await scoutStaking.entropyReader()).to.equal(entropyReader.address);
       expect(await scoutStaking.rewardsPeriod()).to.equal(
         recurrentRewardPeriod
       );
@@ -470,7 +514,8 @@ describe("ScoutInitialStaking", function () {
         nonDeployer,
         1,
         rewardAttribute,
-        "1"
+        "3",
+        entropyReader
       );
 
       const owner = await nftToStake.ownerOf(1);
@@ -484,7 +529,8 @@ describe("ScoutInitialStaking", function () {
         nonDeployer2,
         2,
         rewardAttribute,
-        "2"
+        "4",
+        entropyReader
       );
 
       const owner = await nftToStake.ownerOf(2);
@@ -506,8 +552,8 @@ describe("ScoutInitialStaking", function () {
     });
 
     it("nonDeployer should claim rewards recurrently", async function () {
-      const recurrentRewardAmountToken1 = rewards.token1["1"];
-      const recurrentRewardAmountToken2 = rewards.token2["1"];
+      const recurrentRewardAmountToken1 = rewards.token1["3"];
+      const recurrentRewardAmountToken2 = rewards.token2["3"];
       for (let i = 1; i < recurrentTests; i++) {
         // Wait for rewards Period;
         s = await advanceToRewardTime(s, recurrentRewardPeriod + 1);
@@ -530,10 +576,10 @@ describe("ScoutInitialStaking", function () {
       await scoutStaking.connect(nonDeployer2).withdrawWithRewards(2);
       expect(await nftToStake.ownerOf(2)).to.equal(nonDeployer2.address);
       expect(await token1.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token1["2"]
+        rewards.token1["4"]
       );
       expect(await token2.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token2["2"]
+        rewards.token2["4"]
       );
     });
 
@@ -556,10 +602,10 @@ describe("ScoutInitialStaking", function () {
       await scoutStaking.connect(nonDeployer2).withdrawWithRewards(2);
       expect(await nftToStake.ownerOf(2)).to.equal(nonDeployer2.address);
       expect(await token1.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token1["2"] * 2
+        rewards.token1["4"] * 2
       );
       expect(await token2.balanceOf(nonDeployer2.address)).to.equal(
-        rewards.token2["2"] * 2
+        rewards.token2["4"] * 2
       );
     });
   });
@@ -616,6 +662,11 @@ describe("ScoutInitialStaking", function () {
         .connect(deployer)
         .withdrawNFT(nftToStake.address, 4);
       await expect(r).to.revertedWith("Token can be withdrawn by owner");
+
+      const r2 = scoutStaking
+        .connect(deployer)
+        .withdrawNFT(scoutStaking.address, 4);
+      await expect(r2).to.revertedWith("Withdrawing staking NFTs not allowed");
     });
 
     it("Should fail to set more than 5 reward tokens", async function () {
